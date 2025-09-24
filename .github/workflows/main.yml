@@ -1,0 +1,71 @@
+name: Create Windows Server 2025 RDP VM with Tailscale VPN
+
+on:
+  workflow_dispatch:
+
+env:
+  VM_DISK: win2025.qcow2
+  RAM: 32G
+  CPU: host,kvm=on
+  CORES: 12
+  SSD_SIZE: 777G
+  ISO_PATH: ./WinServer_2025_Unattended.iso
+  USERNAME: Administrator
+  PASSWORD: ParolaSecure123
+  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+jobs:
+  build_and_run_vm:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Install QEMU and dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y qemu qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virt-manager
+
+    - name: Create 777GB virtual disk for Windows Server
+      run: |
+        qemu-img create -f qcow2 $VM_DISK $SSD_SIZE
+
+    - name: Run Windows Server 2025 VM with emulated CPU, RAM, GPU and virtio SSD
+      run: |
+        nohup qemu-system-x86_64 \
+          -m $RAM \
+          -smp $CORES,cores=$CORES \
+          -cpu $CPU \
+          -drive file=$VM_DISK,if=virtio \
+          -cdrom $ISO_PATH \
+          -boot d \
+          -device virtio-vga,virgl=on \
+          -netdev user,id=net0,hostfwd=tcp::3389-:3389 \
+          -device e1000,netdev=net0 \
+          -nographic &
+
+        # Așteaptă ca Windows să se instaleze (sau instalează unattended)
+        sleep 1800
+
+    - name: Enable Remote Desktop and configure firewall in VM via PowerShell Remoting
+      run: |
+        # Exemplu pentru configurare PowerShell: poate fi adaptat în funcție de accesul dvs. la VM
+        pwsh -Command "
+          Invoke-Command -ComputerName localhost -ScriptBlock {
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0;
+            Enable-NetFirewallRule -DisplayGroup 'Remote Desktop';
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1;
+            net user $env:USERNAME $env:PASSWORD
+          }
+        "
+
+    - name: Install Tailscale and authenticate with authkey
+      run: |
+        curl -fsSL https://tailscale.com/install.sh | sh
+        sudo tailscale up --authkey=${TAILSCALE_AUTHKEY} --accept-routes --hostname=win2025-server
+
+    - name: Get Tailscale IP and output connection info
+      run: |
+        TS_IP=$(tailscale ip -4)
+        echo "Windows Server 2025 cu RDP este gata!"
+        echo "IP Tailscale: $TS_IP"
+        echo "Username: $USERNAME"
+        echo "Parola: $PASSWORD"
+        
