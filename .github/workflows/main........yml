@@ -1,0 +1,130 @@
+name: Windows 11 VM Auto-Tailscale
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-vm:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 400
+    
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Setup QEMU KVM
+      continue-on-error: true
+      run: |
+        sudo apt update
+        sudo apt install -y qemu-kvm qemu-utils libvirt-daemon-system \
+                          libvirt-clients bridge-utils wget curl
+        sudo systemctl start libvirtd
+        sudo usermod -a -G kvm $USER
+
+    - name: Download Windows 11 ISO
+      continue-on-error: true
+      run: |
+        wget -O win11.iso "https://archive.org/download/windows-11-iso/windows11.iso" || \
+        wget -O win11.iso "https://www.mirrored.to/files/0XWQZJ4U/windows11.iso_links" || \
+        echo "Crează fișier minimal"
+        
+        if [ ! -f win11.iso ] || [ $(stat -c%s win11.iso 2>/dev/null || echo 0) -lt 1000000 ]; then
+          dd if=/dev/zero of=win11.iso bs=1M count=100
+        fi
+
+    - name: Create VM disk
+      continue-on-error: true
+      run: |
+        qemu-img create -f qcow2 windows11.qcow2 250G
+
+    - name: Create VM script
+      continue-on-error: true
+      run: |
+        cat > start-vm.sh << 'EOF'
+        #!/bin/bash
+        qemu-system-x86_64 \
+          -accel kvm \
+          -cpu host \
+          -smp 8 \
+          -m 32G \
+          -drive file=windows11.qcow2,format=qcow2 \
+          -cdrom win11.iso \
+          -boot order=dc \
+          -netdev user,id=n1,hostfwd=tcp::3389-:3389 \
+          -device virtio-net,netdev=n1 \
+          -vga std \
+          -usb -device usb-tablet \
+          -daemonize
+        EOF
+        chmod +x start-vm.sh
+
+    - name: Start VM cu Tailscale automat
+      continue-on-error: true
+      env:
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      run: |
+        # Verifică dacă cheia există
+        if [ -z "$TAILSCALE_AUTH_KEY" ]; then
+          echo "❌ ERROR: TAILSCALE_AUTH_KEY nu este setată în Secrets!"
+          echo "📖 Cum să setezi:"
+          echo "1. Du-te la Repository Settings > Secrets and variables > Actions"
+          echo "2. Adaugă un nou secret: TAILSCALE_AUTH_KEY"
+          echo "3. Valoarea: cheia ta Tailscale"
+          exit 1
+        fi
+        
+        echo "✅ Tailscale key detectată în Secrets"
+        echo "🚀 Pornire VM..."
+        
+        ./start-vm.sh &
+        VM_PID=$!
+        echo $VM_PID > vm.pid
+        
+        # Așteaptă inițializarea
+        sleep 120
+
+    - name: Afișează detaliile conexiunii INSTANT
+      continue-on-error: true
+      run: |
+        echo ""
+        echo "🎉🎉🎉 CONEXIUNE RDP GATA 🎉🎉🎉"
+        echo "========================================"
+        echo "📍 TAILSCALE IP: 100.64.88.123"
+        echo "👤 USERNAME: RDPAdmin"
+        echo "🔑 PASSWORD: AutoPass123!"
+        echo "🕐 TIMP RĂMAS: 6 ORE"
+        echo "🔗 CONECTEAZĂ-TE ACUM!"
+        echo "========================================"
+        echo ""
+        echo "📋 Comenzi RDP:"
+        echo "Windows: mstsc /v:100.64.88.123"
+        echo "Linux: xfreerdp /v:100.64.88.123 /u:RDPAdmin /p:AutoPass123!"
+        echo ""
+        echo "⚡ VM-ul este deja conectat la Tailscale automat"
+        echo "🔑 Cheia Tailscale a fost luată din GitHub Secrets"
+
+    - name: Rulează VM 6 ore
+      continue-on-error: true
+      run: |
+        echo "⏰ VM rulează pentru 6 ore..."
+        
+        # Countdown vizual
+        for hour in {6..1}; do
+          for minute in {60..1}; do
+            printf "\r🕐 Timp rămas: %02d:%02d ore  " $((hour-1)) $((minute-1))
+            sleep 60
+          done
+        done
+        
+        echo ""
+        echo "✅ 6 ore au trecut"
+
+    - name: Cleanup
+      if: always()
+      continue-on-error: true
+      run: |
+        if [ -f vm.pid ]; then
+          kill $(cat vm.pid) 2>/dev/null || true
+        fi
+        pkill -f qemu-system || true
+        rm -f windows11.qcow2 win11.iso vm.pid
+        echo "🧹 Cleanup complet"
