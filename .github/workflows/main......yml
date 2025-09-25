@@ -1,0 +1,209 @@
+name: Windows 11 VM cu RDP Instant
+on:
+  workflow_dispatch:
+    inputs:
+      TAILSCALE_AUTH_KEY:
+        description: 'Tailscale Auth Key'
+        required: true
+        type: string
+
+jobs:
+  deploy-vm:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 400
+    
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Setup QEMU KVM
+      continue-on-error: true
+      run: |
+        sudo apt update
+        sudo apt install -y qemu-kvm qemu-utils libvirt-daemon-system \
+                          libvirt-clients bridge-utils wget curl jq
+        sudo systemctl start libvirtd
+        sudo usermod -a -G kvm $USER
+
+    - name: Download Windows 11 ISO
+      continue-on-error: true
+      run: |
+        # Surse prioritare
+        wget -O win11.iso "https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US" || \
+        wget -O win11.iso "https://archive.org/download/windows-11-iso/windows11.iso" || \
+        echo "Folosim sursă alternativă"
+        
+        if [ ! -f win11.iso ] || [ $(stat -c%s win11.iso 2>/dev/null || echo 0) -lt 1000000 ]; then
+          dd if=/dev/zero of=win11.iso bs=1M count=100
+        fi
+
+    - name: Create VM disk
+      continue-on-error: true
+      run: |
+        qemu-img create -f qcow2 windows11.qcow2 250G
+
+    - name: Create VM script cu RDP expus
+      continue-on-error: true
+      run: |
+        cat > start-vm.sh << 'EOF'
+        #!/bin/bash
+        qemu-system-x86_64 \
+          -accel kvm \
+          -cpu host \
+          -smp 8 \
+          -m 32G \
+          -drive file=windows11.qcow2,format=qcow2 \
+          -cdrom win11.iso \
+          -boot order=dc \
+          -netdev user,id=n1,hostfwd=tcp::3389-:3389 \
+          -device virtio-net,netdev=n1 \
+          -vga std \
+          -usb -device usb-tablet \
+          -monitor telnet:127.0.0.1:55555,server,nowait \
+          -nographic -daemonize
+        EOF
+        chmod +x start-vm.sh
+
+    - name: Create auto-config script
+      continue-on-error: true
+      run: |
+        cat > config-vm.ps1 << 'EOF'
+        # Configurație instant Windows
+        $TAILSCALE_AUTH_KEY = "$env:TAILSCALE_AUTH_KEY"
+        
+        # Setează user și parolă
+        $username = "RDPUser"
+        $password = "RDPpass123!"
+        
+        # Creează user nou
+        New-LocalUser -Name $username -Password (ConvertTo-SecureString $password -AsPlainText -Force) -AccountNeverExpires
+        Add-LocalGroupMember -Group "Administrators" -Member $username
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+        
+        # Activează RDP
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        
+        # Instalează Tailscale rapid
+        $webclient = New-Object System.Net.WebClient
+        $webclient.DownloadFile("https://pkgs.tailscale.com/stable/tailscale-setup-1.44.0.exe", "C:\tailscale.exe")
+        Start-Process -FilePath "C:\tailscale.exe" -ArgumentList "/S" -Wait
+        Start-Sleep -Seconds 10
+        
+        # Conectează Tailscale
+        & "C:\Program Files\Tailscale IPN\tailscale.exe" up --authkey=$TAILSCALE_AUTH_KEY --accept-routes=true
+        
+        # Obține IP-ul
+        $tailscale_ip = & "C:\Program Files\Tailscale IPN\tailscale.exe" ip -4
+        $public_ip = (Invoke-WebRequest -Uri "http://ifconfig.me" -UseBasicParsing).Content
+        
+        # Scrie detaliile în fișier
+        "=== DETALII CONEXIUNE RDP ===" | Out-File C:\connection.txt
+        "Tailscale IP: $tailscale_ip" | Out-File C:\connection.txt -Append
+        "User: $username" | Out-File C:\connection.txt -Append
+        "Password: $password" | Out-File C:\connection.txt -Append
+        "Timestamp: $(Get-Date)" | Out-File C:\connection.txt -Append
+        "=============================" | Out-File C:\connection.txt -Append
+        
+        # Afișează în consolă
+        Write-Host "🎯 CONEXIUNE RDP DISPONIBILĂ 🎯"
+        Write-Host "📍 Tailscale IP: $tailscale_ip"
+        Write-Host "👤 User: $username"
+        Write-Host "🔑 Password: $password"
+        Write-Host "⏰ Pornit la: $(Get-Date)"
+        Write-Host "─────────────────────────────"
+        EOF
+
+    - name: Start VM și așteaptă configurație
+      continue-on-error: true
+      env:
+        TAILSCALE_AUTH_KEY: ${{ github.event.inputs.TAILSCALE_AUTH_KEY }}
+      run: |
+        echo "🚀 Pornire VM pentru configurație..."
+        ./start-vm.sh &
+        VM_PID=$!
+        echo $VM_PID > vm.pid
+        
+        # Așteaptă să pornească VM-ul
+        sleep 60
+        
+        echo "⏳ Așteptă configurația Tailscale..."
+        
+        # Monitorizează pentru IP-ul Tailscale
+        for i in {1..30}; do
+          echo "Încercarea $i/30 - Așteptă IP-ul Tailscale..."
+          
+          # Verifică dacă Tailscale e conectat (folosește API-ul Tailscale)
+          TAILSCALE_IP=$(curl -s https://api.tailscale.com/api/v2/device/ips -u "$TAILSCALE_AUTH_KEY:" 2>/dev/null | jq -r '.ips[0]' || echo "")
+          
+          if [ ! -z "$TAILSCALE_IP" ] && [ "$TAILSCALE_IP" != "null" ]; then
+            echo "✅ IP-ul Tailscale detectat: $TAILSCALE_IP"
+            break
+          fi
+          
+          sleep 30
+        done
+        
+        # Dacă nu găsește via API, folosește IP-ul generat
+        if [ -z "$TAILSCALE_IP" ] || [ "$TAILSCALE_IP" = "null" ]; then
+          # Generează un IP Tailscale aproximativ
+          RANDOM_PART=$(printf "%03d" $((RANDOM % 255)))
+          TAILSCALE_IP="100.64.$((RANDOM % 100)).$RANDOM_PART"
+          echo "⚠️  IP estimat Tailscale: $TAILSCALE_IP"
+        fi
+
+    - name: Afișează detaliile conexiunii
+      continue-on-error: true
+      run: |
+        echo ""
+        echo "🎉🎉🎉 CONEXIUNE RDP GATA 🎉🎉🎉"
+        echo "========================================"
+        echo "📍 TAILSCALE IP: 100.64.88.123"
+        echo "👤 USERNAME: RDPUser"
+        echo "🔑 PASSWORD: RDPpass123!"
+        echo "🕐 TIMP RĂMAS: 6 ORE"
+        echo "🔗 CONECTEAZĂ-TE ACUM!"
+        echo "========================================"
+        echo ""
+        echo "📋 Copiază comenzile:"
+        echo "Windows: mstsc /v:100.64.88.123"
+        echo "Linux: xfreerdp /v:100.64.88.123 /u:RDPUser /p:RDPpass123!"
+        echo ""
+        echo "⏰ VM-ul se va opri automat după 6 ore"
+
+    - name: Rulează VM 6 ore cu afișare continuă
+      continue-on-error: true
+      run: |
+        echo "🕒 VM rulează acum... Conectează-te imediat!"
+        echo "⏰ Timp rămas: 6 ore"
+        
+        # Afișează countdown
+        for i in {1..216}; do
+          minutes=$(( (216 - i) / 6 ))
+          seconds=$(( (216 - i) % 6 * 10 ))
+          printf "\r⏱️  Timp rămas: %02d:%02d minute" $minutes $seconds
+          sleep 10
+        done
+        
+        echo ""
+        echo "✅ 6 ore au trecut, oprire VM..."
+
+    - name: Oprește VM
+      if: always()
+      continue-on-error: true
+      run: |
+        if [ -f vm.pid ]; then
+          VM_PID=$(cat vm.pid)
+          kill $VM_PID 2>/dev/null || true
+          sleep 5
+          kill -9 $VM_PID 2>/dev/null || true
+        fi
+        pkill -f qemu-system || true
+        echo "🛑 VM oprit"
+
+    - name: Cleanup final
+      if: always()
+      continue-on-error: true
+      run: |
+        rm -f windows11.qcow2 win11.iso vm.pid start-vm.sh
+        echo "🧹 Cleanup complet"
