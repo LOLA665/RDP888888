@@ -1,0 +1,124 @@
+name: Windows Gaming Optimized RDP Setup
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *' # rulează la fiecare 6 ore
+
+jobs:
+  optimize-gaming-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Enable Windows Gaming Features and Performance
+        run: |
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\GameBar" -Name "AutoGameModeEnabled" -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" -Name "HwSchMode" -Value 2 -Type DWord -Force
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" -Name "EnableVirtualizationBasedSecurity" -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" -Name "Enabled" -Value 0 -Type DWord -Force
+          Disable-WindowsOptionalFeature -Online -FeatureName "VirtualMachinePlatform" -NoRestart
+          DISM /Online /Disable-Feature /FeatureName:"CoreIsolation"
+          powercfg /setactive SCHEME_MIN
+
+      - name: Configure RDP and Firewall
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Rule" -ErrorAction SilentlyContinue
+          netsh advfirewall firewall add rule name="RDP-Rule" protocol=TCP dir=in localport=3389 action=allow
+          Restart-Service -Name TermService -Force
+
+      - name: Create Single User RTXuser
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $passwordParts = $charSet.Upper | Get-Random -Count 4
+          $passwordParts += $charSet.Lower | Get-Random -Count 4
+          $passwordParts += $charSet.Number | Get-Random -Count 4
+          $passwordParts += $charSet.Special | Get-Random -Count 4
+          $password = -join ($passwordParts | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          $userExists = Get-LocalUser -Name "RTXuser" -ErrorAction SilentlyContinue
+          if ($userExists) {
+            Set-LocalUser -Name "RTXuser" -Password $securePass
+          } else {
+            New-LocalUser -Name "RTXuser" -Password $securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RTXuser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RTXuser"
+
+          echo "RDP_USERNAME=RTXuser" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Mount SSD D: as C: (Demo)
+        run: |
+          $disk = Get-Disk | Where-Object IsBoot -eq $false | Sort-Object -Property Size -Descending | Select-Object -First 1
+          $partition = $disk | Get-Partition | Where-Object DriveLetter -eq 'D'
+          if ($partition) {
+            Remove-PartitionAccessPath -DiskNumber $disk.Number -PartitionNumber $partition.PartitionNumber -AccessPath "D:"
+            Add-PartitionAccessPath -DiskNumber $disk.Number -PartitionNumber $partition.PartitionNumber -AccessPath "C:"
+            Write-Host "Drive D: mounted as C:"
+          } else {
+            Write-Host "Drive D: not found."
+          }
+
+      - name: Install Gaming Boost Apps
+        run: |
+          $apps = @(
+            "https://download.razer.com/cortex/install/razer-cortex.exe",
+            "https://download.msi.com/uti_exe/vga/MSIAfterburnerSetup.zip",
+            "https://cdn.discordapp.com/attachments/877453666808227860/945183818384008852/Advanced_SystemCare_14.2.0.exe",
+            "https://download.glarysoft.com/glary-utilities_5_198_0.exe",
+            "https://www.cpuid.com/files/cpu-z/cpu-z_2.04-en.exe",
+            "https://files.techpowerup.com/files/details/gpu-z_2.50.0.exe",
+            "https://download.ccleaner.com/ccsetup598.exe",
+            "https://download.iobit.com/driver-booster/setup.exe",
+            "https://filehippo.com/download-speccy/download/",
+            "https://game-mode-link-or-windows-optimization-tool.exe"
+          )
+          foreach ($app in $apps) {
+            try {
+              $fileName = "$env:TEMP\" + ([IO.Path]::GetFileName($app))
+              Invoke-WebRequest -Uri $app -OutFile $fileName
+              Start-Process -FilePath $fileName -ArgumentList "/silent","/norestart" -Wait
+            }
+            catch {
+              Write-Host "Failed to install $app, skipping."
+            }
+          }
+
+      - name: Optimize C Drive for Space
+        run: |
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy" -Name "01" -Value 1 -Type DWord -Force
+          Start-Process -FilePath cleanmgr.exe -ArgumentList "/sagerun:1" -Wait
+          Disable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -NoRestart
+          Set-MpPreference -DisableScheduleAppUpgrade $true
+          Set-MpPreference -DisableScheduledScanning $true
+          Remove-Item -Path "$env:SystemRoot\SoftwareDistribution\Download\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\Windows\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "Optimized C drive and freed up space."
+
+      - name: Display RDP Info
+        run: |
+          $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -ne "Loopback Pseudo-Interface 1" } | Select-Object -First 1).IPAddress
+          Write-Host "RDP IP Address: $ip"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: $env:RDP_PASSWORD"
+
+      - name: Keep Workflow Alive
+        run: |
+          $startTime = Get-Date
+          while ((Get-Date) - $startTime -lt (New-TimeSpan -Hours 6)) {
+            Write-Host "RTXuser session active: $(Get-Date)"
+            Start-Sleep -Seconds 300
+          }
+          
