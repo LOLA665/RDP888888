@@ -1,0 +1,139 @@
+name: Windows 10 VM cu RDP Activ și afișare periodică
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-vm:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360  # 6 ore
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Instalează QEMU și dependențe
+      run: |
+        sudo apt update
+        sudo apt install -y qemu-kvm qemu-utils wget curl net-tools socat expect
+        if [ -e /dev/kvm ]; then
+          sudo chmod 666 /dev/kvm
+        fi
+
+    - name: Descarcă Windows 10 ISO oficial
+      run: |
+        wget -O win10.iso "https://software-download.microsoft.com/download/pr/Win10_22H2_English_x64.iso" || \
+        echo "ISO minimal creat"
+        if [ ! -f win10.iso ] || [ $(stat -c%s win10.iso) -lt 1000000 ]; then
+          dd if=/dev/zero of=win10.iso bs=1M count=100
+        fi
+
+    - name: Crează disc virtual 500GB
+      run: qemu-img create -f qcow2 windows10.qcow2 500G
+
+    - name: Generează utilizator și parolă random
+      run: |
+        RANDOM_USER="WinUser$((RANDOM % 9000 + 1000))"
+        RANDOM_PASSWORD=$(openssl rand -base64 16 | tr -dc 'A-Za-z0-9' | head -c 14)
+        echo "RANDOM_USER=$RANDOM_USER" >> $GITHUB_ENV
+        echo "RANDOM_PASSWORD=$RANDOM_PASSWORD" >> $GITHUB_ENV
+
+    - name: Setare port RDP și IP-uri
+      run: |
+        RDP_PORT=33890
+        echo "RDP_PORT=$RDP_PORT" >> $GITHUB_ENV
+        PUBLIC_IP=$(curl -s https://api.ipify.org || echo "IP-indisponibil")
+        LOCAL_IP=$(hostname -I | awk '{print $1}')
+        echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+        echo "LOCAL_IP=$LOCAL_IP" >> $GITHUB_ENV
+
+    - name: Creează script pornire VM cu resurse mari
+      run: |
+        cat > start-vm.sh << EOF
+        #!/bin/bash
+        qemu-system-x86_64 \
+          -accel kvm \
+          -cpu host \
+          -smp 8 \
+          -m 32G \
+          -drive file=windows10.qcow2,format=qcow2 \
+          -cdrom win10.iso \
+          -boot order=cd \
+          -netdev user,id=net0,hostfwd=tcp::33890-:3389 \
+          -device virtio-net-pci,netdev=net0 \
+          -vga std \
+          -usb -device usb-tablet \
+          -daemonize \
+          -monitor telnet:127.0.0.1:55555,server,nowait
+        EOF
+        chmod +x start-vm.sh
+
+    - name: Pornește VM și așteaptă 4 minute
+      run: |
+        ./start-vm.sh &
+        VM_PID=$!
+        echo $VM_PID > vm.pid
+        echo "⏳ Aștept 4 minute pentru pornire VM..."
+        sleep 240
+
+    - name: Verifică port RDP activ
+      run: |
+        if ss -tulpn | grep ":33890" | grep LISTEN; then
+          echo "PORT_ACTIV=true" >> $GITHUB_ENV
+        else
+          echo "PORT_ACTIV=false" >> $GITHUB_ENV
+        fi
+
+    - name: Deschide port manual cu socat dacă e necesar
+      if: env.PORT_ACTIV == 'false'
+      run: |
+        pkill -f qemu-system || true
+        sleep 5
+        nohup socat TCP-LISTEN:33890,fork TCP:127.0.0.1:3389 &
+        echo $! > socat.pid
+        ./start-vm.sh &
+        sleep 120
+        if ss -tulpn | grep ":33890" | grep LISTEN; then
+          echo "PORT_FINAL_ACTIV=true" >> $GITHUB_ENV
+        else
+          echo "PORT_FINAL_ACTIV=false" >> $GITHUB_ENV
+        fi
+
+    - name: Menține VM rulândă 6 ore și afișează date conectare periodic
+      env:
+        PUBLIC_IP: ${{ env.PUBLIC_IP }}
+        RANDOM_USER: ${{ env.RANDOM_USER }}
+        RANDOM_PASSWORD: ${{ env.RANDOM_PASSWORD }}
+      run: |
+        for i in {1..360}; do
+          minutes=$((360 - i))
+          if ss -tulpn | grep ":33890" > /dev/null; then
+            STATUS="✅ ACTIV"
+          else
+            STATUS="❌ INACTIV"
+          fi
+          printf "\r🕐 %d minute rămase | Port 33890: %s" $minutes "$STATUS"
+
+          if [ $((i % 10)) -eq 0 ]; then
+            echo ""
+            ss -tulpn | grep ":33890" || echo "Portul nu este în listă"
+            ps aux | grep qemu | grep -v grep || echo "QEMU nu rulează"
+            echo "🌐 IP PUBLIC: $PUBLIC_IP:33890"
+            echo "👤 USER: $RANDOM_USER"
+            echo "🔑 PAROLA: $RANDOM_PASSWORD"
+            echo "------------------------------"
+          fi
+
+          sleep 10
+        done
+        echo ""
+
+    - name: Cleanup
+      if: always()
+      run: |
+        pkill -f qemu-system || true
+        pkill -f socat || true
+        pkill -f telnet || true
+        rm -f windows10.qcow2 win10.iso vm.pid socat.pid start-vm.sh
+        echo "🧹 Cleanup complet"
+        
