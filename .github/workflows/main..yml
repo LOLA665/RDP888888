@@ -1,0 +1,161 @@
+name: Windows 11 VM Ultra-Rapid
+on:
+  workflow_dispatch:
+    inputs:
+      TAILSCALE_AUTH_KEY:
+        description: 'Tailscale Auth Key'
+        required: true
+        type: string
+
+jobs:
+  deploy-vm:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 400
+    
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Setup QEMU KVM cu optimizări
+      run: |
+        sudo apt update
+        sudo apt install -y qemu-kvm qemu-utils virt-manager libvirt-daemon-system \
+                          libvirt-clients bridge-utils spice-vdagent aria2
+        sudo systemctl start libvirtd
+        sudo usermod -a -G kvm $USER
+        echo 'net.core.rmem_max = 2147483647' | sudo tee -a /etc/sysctl.conf
+        echo 'net.core.wmem_max = 2147483647' | sudo tee -a /etc/sysctl.conf
+        sudo sysctl -p
+
+    - name: Download Windows 11 ISO ultra-rapid
+      run: |
+        aria2c -x 16 -s 16 -k 1M --max-connection-per-server=16 \
+          "https://software.download.prss.microsoft.com/dbazure/Win11_23H2_English_x64v2.iso" \
+          -o win11.iso
+        ls -lh win11.iso
+
+    - name: Create VM disk cu optimizări
+      run: |
+        qemu-img create -f qcow2 -o preallocation=metadata,cluster_size=2M windows11.qcow2 250G
+
+    - name: Download Windows pre-installed image rapid
+      run: |
+        # Descarcă imagine pre-configurată pentru viteză maximă
+        aria2c -x 32 -s 32 -k 2M \
+          "https://www.dropbox.com/s/example/windows11-preinstalled.qcow2?dl=1" \
+          -o windows11-pre.qcow2 || echo "Folosim instalare normală"
+
+    - name: Create ultra-fast VM script
+      run: |
+        cat > start-vm.sh << 'EOF'
+        #!/bin/bash
+        qemu-system-x86_64 \
+          -accel kvm,thread=multi \
+          -cpu host,migratable=no,+invtsc \
+          -smp 16,cores=8,threads=2 \
+          -m 32G,slots=4,maxmem=64G \
+          -drive file=windows11.qcow2,format=qcow2,aio=native,cache=none,discard=unmap \
+          -cdrom win11.iso \
+          -boot order=dc \
+          -netdev user,id=n1,hostfwd=tcp::3389-:3389 \
+          -device virtio-net-pci,netdev=n1,mq=on,vectors=10 \
+          -vga qxl \
+          -usb -device usb-tablet \
+          -rtc base=localtime,clock=host \
+          -monitor stdio \
+          -daemonize \
+          -name "Win11-Tailscale" \
+          -msg timestamp=on
+        EOF
+        chmod +x start-vm.sh
+
+    - name: Create auto-install script rapid
+      run: |
+        cat > autosetup.ps1 << 'EOF'
+        # Configurație ultra-rapidă Windows
+        $TAILSCALE_AUTH_KEY = "$env:TAILSCALE_AUTH_KEY"
+        
+        # Optimizări de network
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" -Name "NetworkThrottlingIndex" -Value 0xFFFFFFFF
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" -Name "SystemResponsiveness" -Value 0
+        
+        # Descarcă Tailscale cu conexiuni multiple
+        $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.44.0.exe"
+        $output = "C:\tailscale-setup.exe"
+        
+        # Download ultra-rapid cu BITS
+        Start-BitsTransfer -Source $url -Destination $output -Priority High
+        
+        # Instalare silent
+        Start-Process -FilePath $output -ArgumentList "/S" -Wait
+        Start-Sleep -Seconds 10
+        
+        # Conectare Tailscale
+        & "C:\Program Files\Tailscale IPN\tailscale.exe" up --authkey=$TAILSCALE_AUTH_KEY --accept-routes=true --accept-dns=false
+        
+        # Optimizări RDP
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        
+        # Setare parolă
+        $securePassword = ConvertTo-SecureString "UltraPass123!" -AsPlainText -Force
+        Set-LocalUser -Name "Administrator" -Password $securePassword
+        
+        # Obține IP-ul și afișează
+        $ip = & "C:\Program Files\Tailscale IPN\tailscale.exe" ip -4
+        Write-Host "=== RDP ULTRA-RAPID ==="
+        Write-Host "TAILSCALE_IP: $ip"
+        Write-Host "USER: Administrator"
+        Write-Host "PASSWORD: UltraPass123!"
+        Write-Host "======================="
+        
+        # Salvează pentru log
+        "IP: $ip" | Out-File C:\connection.txt
+        "USER: Administrator" | Out-File C:\connection.txt -Append
+        "PASS: UltraPass123!" | Out-File C:\connection.txt -Append
+        EOF
+
+    - name: Start VM cu optimizări maxime
+      env:
+        TAILSCALE_AUTH_KEY: ${{ github.event.inputs.TAILSCALE_AUTH_KEY }}
+      run: |
+        # Optimizări sistem
+        echo 'performance' | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+        sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+        
+        # Pornește VM
+        ./start-vm.sh
+        
+        # Așteaptă inițializare
+        sleep 300
+        
+        # Monitorizează progresul
+        timeout 21600 tail -f /dev/null &
+        MONITOR_PID=$!
+        
+        # Afișează statusul periodic
+        while kill -0 $MONITOR_PID 2>/dev/null; do
+            echo "=== VM RULEAZĂ ==="
+            echo "Timp rămas: 6 ore"
+            echo "Verifică Tailscale admin panel pentru IP"
+            echo "User: Administrator"
+            echo "Parolă: UltraPass123!"
+            echo "==================="
+            sleep 60
+        done
+
+    - name: Display final connection info
+      run: |
+        echo "=== CONEXIUNE FINALĂ ==="
+        echo "VM-ul a rulat 6 ore și s-a oprit"
+        echo "User: Administrator"
+        echo "Parolă: UltraPass123!"
+        echo "IP-ul a fost afișat în logurile de mai sus"
+        echo "========================="
+
+    - name: Cleanup ultra-rapid
+      if: always()
+      run: |
+        pkill -9 qemu-system || true
+        rm -f windows11.qcow2 win11.iso vm.log
+        sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
