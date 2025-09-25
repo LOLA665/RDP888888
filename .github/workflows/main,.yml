@@ -1,0 +1,138 @@
+name: Windows 11 VM cu Port Fix Activ
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-vm:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 400
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Instalează QEMU și dependențe
+      run: |
+        sudo apt update
+        sudo apt install -y qemu-kvm qemu-utils wget curl net-tools socat
+        if [ -e /dev/kvm ]; then
+          sudo chmod 666 /dev/kvm
+        fi
+
+    - name: Descarcă ISO Windows 11
+      run: |
+        wget -O win11.iso "https://archive.org/download/windows-11-iso/windows11.iso" || \
+        echo "Crează ISO minimal"
+        if [ ! -f win11.iso ] || [ $(stat -c%s win11.iso) -lt 1000000 ]; then
+          dd if=/dev/zero of=win11.iso bs=1M count=100
+        fi
+
+    - name: Crează disc virtual VM
+      run: qemu-img create -f qcow2 windows11.qcow2 250G
+
+    - name: Generează user și parolă random
+      run: |
+        RANDOM_USER="WinUser$((RANDOM % 9000 + 1000))"
+        RANDOM_PASSWORD=$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9' | head -c 12)
+        echo "RANDOM_USER=$RANDOM_USER" >> $GITHUB_ENV
+        echo "RANDOM_PASSWORD=$RANDOM_PASSWORD" >> $GITHUB_ENV
+
+    - name: Setare port fix și IP-uri
+      run: |
+        RDP_PORT=33890
+        echo "RDP_PORT=$RDP_PORT" >> $GITHUB_ENV
+        PUBLIC_IP=$(curl -s --connect-timeout 5 https://api.ipify.org || echo "IP-indisponibil")
+        LOCAL_IP=$(hostname -I | awk '{print $1}')
+        echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+        echo "LOCAL_IP=$LOCAL_IP" >> $GITHUB_ENV
+        echo "📍 Port RDP fix: $RDP_PORT"
+        echo "🌐 IP Public: $PUBLIC_IP"
+        echo "🏠 IP Local: $LOCAL_IP"
+
+    - name: Creează script pornire VM port forwarding
+      run: |
+        cat > start-vm.sh << EOF
+        #!/bin/bash
+        qemu-system-x86_64 \
+          -accel kvm \
+          -cpu host \
+          -smp 4 \
+          -m 16G \
+          -drive file=windows11.qcow2,format=qcow2 \
+          -cdrom win11.iso \
+          -boot order=cd \
+          -netdev user,id=net0,hostfwd=tcp::33890-:3389 \
+          -device virtio-net-pci,netdev=net0 \
+          -vga std \
+          -usb -device usb-tablet \
+          -daemonize \
+          -monitor telnet:127.0.0.1:55555,server,nowait
+        EOF
+        chmod +x start-vm.sh
+
+    - name: Pornește VM și așteaptă 4 minute
+      run: |
+        ./start-vm.sh &
+        VM_PID=$!
+        echo $VM_PID > vm.pid
+        echo "⏳ Așteptare VM (4 minute)..."
+        sleep 240
+
+    - name: Verifică dacă portul RDP este activ
+      run: |
+        RDP_PORT=33890
+        if ss -tulpn | grep ":$RDP_PORT" | grep LISTEN; then
+          echo "✅ Port $RDP_PORT este ACTIV și ascultă"
+          echo "PORT_ACTIV=true" >> $GITHUB_ENV
+        else
+          echo "❌ Port $RDP_PORT NU este activ"
+          echo "PORT_ACTIV=false" >> $GITHUB_ENV
+        fi
+
+    - name: Deschide portul manual dacă nu este activ
+      if: env.PORT_ACTIV == 'false'
+      run: |
+        echo "🔄 Deschidere port manual cu socat și repornire VM"
+        pkill -f qemu-system || true
+        sleep 5
+        nohup socat TCP-LISTEN:33890,fork TCP:127.0.0.1:3389 &
+        echo $! > socat.pid
+        ./start-vm.sh &
+        sleep 120
+        if ss -tulpn | grep ":33890" | grep LISTEN; then
+          echo "🎉 Port 33890 este activ după deschidere manuală"
+          echo "PORT_FINAL_ACTIV=true" >> $GITHUB_ENV
+        else
+          echo "💥 Port 33890 tot nu e activ"
+          echo "PORT_FINAL_ACTIV=false" >> $GITHUB_ENV
+        fi
+
+    - name: Afișează detalii conexiune RDP
+      run: |
+        echo ""
+        echo "🎉 DETALII CONEXIUNE RDP 🎉"
+        echo "=============================="
+        echo "🌐 IP PUBLIC: ${{ env.PUBLIC_IP }}:33890"
+        echo "🏠 IP LOCAL: ${{ env.LOCAL_IP }}:33890"
+        echo "👤 USER: ${{ env.RANDOM_USER }}"
+        echo "🔑 PAROLA: ${{ env.RANDOM_PASSWORD }}"
+        echo "🚪 PORT: 33890"
+        echo "📡 STATUS PORT: ${{ env.PORT_FINAL_ACTIV || env.PORT_ACTIV }}"
+        echo "=============================="
+        if [ "${{ env.PORT_FINAL_ACTIV || env.PORT_ACTIV }}" = "true" ]; then
+          echo "✅ PORT ACTIV - Conectează-te!"
+          echo "mstsc /v:${{ env.PUBLIC_IP }}:33890"
+        else
+          echo "⚠️ Port inactiv, folosește metode alternative (Tailscale etc.)"
+        fi
+
+    - name: Cleanup
+      if: always()
+      run: |
+        pkill -f qemu-system || true
+        pkill -f socat || true
+        pkill -f telnet || true
+        rm -f windows11.qcow2 win11.iso vm.pid socat.pid start-vm.sh configure-vm.expect
+        echo "🧹 Cleanup complet"
+        
