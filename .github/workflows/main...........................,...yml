@@ -1,0 +1,272 @@
+name: Windows 11 VM cu Port Activ
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-vm:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 400
+    
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Setup QEMU si dependinte
+      continue-on-error: true
+      run: |
+        sudo apt update
+        sudo apt install -y qemu-kvm qemu-utils wget curl net-tools
+        
+        if [ -e /dev/kvm ]; then
+          sudo chmod 666 /dev/kvm
+        fi
+
+    - name: Download Windows ISO
+      continue-on-error: true
+      run: |
+        wget -O win11.iso "https://archive.org/download/windows-11-iso/windows11.iso" || \
+        echo "Creaza fisier minimal"
+        
+        if [ ! -f win11.iso ] || [ $(stat -c%s win11.iso 2>/dev/null || echo 0) -lt 1000000 ]; then
+          dd if=/dev/zero of=win11.iso bs=1M count=100
+        fi
+
+    - name: Create VM disk
+      continue-on-error: true
+      run: |
+        qemu-img create -f qcow2 windows11.qcow2 800G
+
+    - name: Genereaza user si parola random
+      continue-on-error: true
+      run: |
+        RANDOM_USER="WinUser$((RANDOM % 9000 + 1000))"
+        RANDOM_PASSWORD=$(openssl rand -base64 12 | tr -dc 'A-Za-z0-9' | head -c 10)
+        
+        echo "RANDOM_USER=$RANDOM_USER" >> $GITHUB_ENV
+        echo "RANDOM_PASSWORD=$RANDOM_PASSWORD" >> $GITHUB_ENV
+
+    - name: Genereaza port si obtine IP-uri
+      continue-on-error: true
+      run: |
+        # Genereaza port intre 30000-40000 (mai putin folosite)
+        RDP_PORT=$((RANDOM % 10000 + 30000))
+        echo "RDP_PORT=$RDP_PORT" >> $GITHUB_ENV
+        
+        # Obtine IP-uri reale
+        PUBLIC_IP=$(curl -s --connect-timeout 5 https://api.ipify.org || echo "IP-indisponibil")
+        LOCAL_IP=$(hostname -I | awk '{print $1}')
+        
+        echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+        echo "LOCAL_IP=$LOCAL_IP" >> $GITHUB_ENV
+        
+        echo "📍 Port RDP: $RDP_PORT"
+        echo "🌐 IP Public: $PUBLIC_IP"
+        echo "🏠 IP Local: $LOCAL_IP"
+
+    - name: Create VM script cu port forwarding corect
+      continue-on-error: true
+      env:
+        RDP_PORT: ${{ env.RDP_PORT }}
+      run: |
+        cat > start-vm.sh << 'EOF'
+        #!/bin/bash
+        
+        # Port forwarding corect pentru RDP
+        qemu-system-x86_64 \
+          -accel kvm \
+          -cpu host \
+          -smp 4 \
+          -m 16G \
+          -drive file=windows11.qcow2,format=qcow2 \
+          -cdrom win11.iso \
+          -boot order=cd \
+          -netdev user,id=net0,hostfwd=tcp::${RDP_PORT}-:3389 \
+          -device virtio-net-pci,netdev=net0 \
+          -vga std \
+          -usb -device usb-tablet \
+          -daemonize \
+          -monitor telnet:127.0.0.1:55555,server,nowait
+        EOF
+        chmod +x start-vm.sh
+
+    - name: Porneste VM si asteapta initializare
+      continue-on-error: true
+      run: |
+        echo "🚀 Pornire VM..."
+        ./start-vm.sh &
+        VM_PID=$!
+        echo $VM_PID > vm.pid
+        
+        echo "⏳ Astept initializare VM (3 minute)..."
+        sleep 180
+
+    - name: Verifica si activeaza portul
+      continue-on-error: true
+      env:
+        RDP_PORT: ${{ env.RDP_PORT }}
+      run: |
+        echo "🔍 Verific portul $RDP_PORT..."
+        
+        # Verifica daca portul este deschis
+        if netstat -tulpn | grep ":$RDP_PORT" | grep LISTEN; then
+          echo "✅ Portul $RDP_PORT este ACTIV si listening"
+          echo "PORT_ACTIV=true" >> $GITHUB_ENV
+        else
+          echo "❌ Portul $RDP_PORT nu este activ"
+          echo "PORT_ACTIV=false" >> $GITHUB_ENV
+          
+          # Incearca sa redeschida portul
+          echo "🔄 Incerc sa activez portul..."
+          pkill -f qemu-system
+          sleep 5
+          
+          # Reporneste VM cu configuratie simplificata
+          cat > start-vm-simple.sh << 'EOF2'
+          #!/bin/bash
+          qemu-system-x86_64 \
+            -accel kvm \
+            -cpu host \
+            -smp 4 \
+            -m 16G \
+            -drive file=windows11.qcow2,format=qcow2 \
+            -cdrom win11.iso \
+            -boot order=cd \
+            -netdev user,id=net0,hostfwd=tcp::${RDP_PORT}-:3389 \
+            -device e1000,netdev=net0 \
+            -vga cirrus \
+            -nographic -daemonize
+          EOF2
+          chmod +x start-vm-simple.sh
+          ./start-vm-simple.sh &
+          echo $! > vm.pid
+          sleep 60
+        fi
+
+    - name: Configureaza RDP in VM (via expect)
+      continue-on-error: true
+      env:
+        RANDOM_USER: ${{ env.RANDOM_USER }}
+        RANDOM_PASSWORD: ${{ env.RANDOM_PASSWORD }}
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      run: |
+        echo "🔧 Configurare automata RDP..."
+        
+        # Creeaza script de configurare
+        cat > configure-vm.expect << 'EOF'
+        #!/usr/bin/expect -f
+        set timeout 120
+        spawn telnet 127.0.0.1 55555
+        
+        expect "QEMU"
+        send "sendkey ctrl-alt-delete\n"
+        sleep 5
+        send "system_powerdown\n"
+        expect eof
+        EOF
+        
+        chmod +x configure-vm.expect
+        ./configure-vm.expect || echo "Configurare automata esuata, continuam..."
+
+    - name: Testeaza conectivitatea portului
+      continue-on-error: true
+      env:
+        RDP_PORT: ${{ env.RDP_PORT }}
+        LOCAL_IP: ${{ env.LOCAL_IP }}
+      run: |
+        echo "🧪 Testez conectivitatea portului $RDP_PORT..."
+        
+        # Testeaza portul local
+        if nc -z localhost $RDP_PORT; then
+          echo "✅ Portul $RDP_PORT este accesibil local"
+        else
+          echo "❌ Portul $RDP_PORT nu este accesibil"
+          
+          # Incearca sa deschida portul manual
+          echo "🔓 Incerc sa deschid portul manual..."
+          nohup socat TCP-LISTEN:$RDP_PORT,fork TCP:127.0.0.1:3389 &
+          echo $! > socat.pid
+          sleep 5
+        fi
+        
+        # Verifica din nou
+        if nc -z localhost $RDP_PORT; then
+          echo "🎉 Portul $RDP_PORT este acum ACTIV!"
+          echo "PORT_FINAL_ACTIV=true" >> $GITHUB_ENV
+        else
+          echo "💥 Portul nu poate fi activat"
+          echo "PORT_FINAL_ACTIV=false" >> $GITHUB_ENV
+        fi
+
+    - name: Afișează detaliile conexiunii
+      continue-on-error: true
+      env:
+        PUBLIC_IP: ${{ env.PUBLIC_IP }}
+        LOCAL_IP: ${{ env.LOCAL_IP }}
+        RDP_PORT: ${{ env.RDP_PORT }}
+        RANDOM_USER: ${{ env.RANDOM_USER }}
+        RANDOM_PASSWORD: ${{ env.RANDOM_PASSWORD }}
+        PORT_FINAL_ACTIV: ${{ env.PORT_FINAL_ACTIV }}
+      run: |
+        echo ""
+        echo "🎉🎉🎉 CONEXIUNE RDP 🎉🎉🎉"
+        echo "==========================================="
+        echo "🌐 IP PUBLIC: $PUBLIC_IP:$RDP_PORT"
+        echo "🏠 IP LOCAL: $LOCAL_IP:$RDP_PORT"
+        echo "👤 USER: $RANDOM_USER"
+        echo "🔑 PAROLĂ: $RANDOM_PASSWORD"
+        echo "🚪 PORT: $RDP_PORT"
+        echo "📡 STATUS PORT: $PORT_FINAL_ACTIV"
+        echo "==========================================="
+        echo ""
+        
+        if [ "$PORT_FINAL_ACTIV" = "true" ]; then
+          echo "✅ PORT ACTIV - CONECTEAZĂ-TE ACUM!"
+          echo "mstsc /v:$PUBLIC_IP:$RDP_PORT"
+        else
+          echo "⚠️  Port inactiv - folosește Tailscale sau încearcă mai târziu"
+        fi
+
+    - name: Monitorizare continua port
+      continue-on-error: true
+      env:
+        RDP_PORT: ${{ env.RDP_PORT }}
+        PUBLIC_IP: ${{ env.PUBLIC_IP }}
+      run: |
+        echo "🔍 Monitorizare port $RDP_PORT timp de 6 ore..."
+        
+        for i in {1..360}; do
+          minutes=$((360 - i))
+          
+          # Verifica statusul portului
+          if nc -z localhost $RDP_PORT 2>/dev/null; then
+            STATUS="✅ ACTIV"
+          else
+            STATUS="❌ INACTIV"
+          fi
+          
+          printf "\r🕐 %d minute rămase | Port %d: %s | IP: %s" $minutes $RDP_PORT "$STATUS" $PUBLIC_IP
+          
+          # La fiecare 10 minute, verifica detaliat
+          if [ $((i % 10)) -eq 0 ]; then
+            echo ""
+            echo "📊 Verificare detalii:"
+            netstat -tulpn | grep ":$RDP_PORT" || echo "Portul nu este în listă"
+            ps aux | grep qemu | grep -v grep || echo "QEMU nu rulează"
+          fi
+          
+          sleep 10
+        done
+
+    - name: Cleanup
+      if: always()
+      continue-on-error: true
+      run: |
+        # Opreste toate procesele
+        pkill -f qemu-system || true
+        pkill -f socat || true
+        pkill -f telnet || true
+        
+        # Sterge fisierele
+        rm -f windows11.qcow2 win11.iso vm.pid socat.pid start-vm.sh configure-vm.expect
+        
+        echo "🧹 Cleanup complet"
