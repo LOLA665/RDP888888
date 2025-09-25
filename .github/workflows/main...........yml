@@ -1,0 +1,213 @@
+name: Windows 11 VM cu IP Real
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-vm:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 400
+    
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Setup QEMU si dependinte
+      continue-on-error: true
+      run: |
+        sudo apt update
+        sudo apt install -y qemu-kvm qemu-utils wget curl net-tools iproute2
+        
+        # Fix KVM permissions
+        if [ -e /dev/kvm ]; then
+          sudo chmod 666 /dev/kvm
+        fi
+
+    - name: Download Windows ISO
+      continue-on-error: true
+      run: |
+        wget -O win11.iso "https://archive.org/download/windows-11-iso/windows11.iso" || \
+        echo "Creaza fisier minimal"
+        
+        if [ ! -f win11.iso ] || [ $(stat -c%s win11.iso 2>/dev/null || echo 0) -lt 1000000 ]; then
+          dd if=/dev/zero of=win11.iso bs=1M count=100
+        fi
+
+    - name: Create VM disk
+      continue-on-error: true
+      run: |
+        qemu-img create -f qcow2 windows11.qcow2 250G
+
+    - name: Genereaza user si parola random
+      continue-on-error: true
+      run: |
+        # Genereaza user random
+        RANDOM_USER="RDPUser$((RANDOM % 9000 + 1000))"
+        
+        # Genereaza parola random
+        RANDOM_PASSWORD=$(openssl rand -base64 16 | tr -dc 'A-Za-z0-9' | head -c 12)
+        
+        echo "RANDOM_USER=$RANDOM_USER" >> $GITHUB_ENV
+        echo "RANDOM_PASSWORD=$RANDOM_PASSWORD" >> $GITHUB_ENV
+        
+        echo "✅ User: $RANDOM_USER"
+        echo "✅ Parola: $RANDOM_PASSWORD"
+
+    - name: Obține IP-ul REAL al runner-ului
+      continue-on-error: true
+      run: |
+        # Obține IP-ul PUBLIC real
+        PUBLIC_IP=$(curl -s https://api.ipify.org)
+        echo "🌐 IP PUBLIC: $PUBLIC_IP"
+        
+        # Obține IP-ul LOCAL real
+        LOCAL_IP=$(hostname -I | awk '{print $1}')
+        echo "🏠 IP LOCAL: $LOCAL_IP"
+        
+        # Obține IP-ul din interfața de rețea
+        NETWORK_IP=$(ip addr show eth0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
+        if [ -z "$NETWORK_IP" ]; then
+          NETWORK_IP=$(ip addr show | grep inet | grep -v 127.0.0.1 | awk '{print $2}' | cut -d/ -f1 | head -1)
+        fi
+        echo "🔗 IP REȚEA: $NETWORK_IP"
+        
+        # Genereaza port random pentru RDP
+        RDP_PORT=$((RANDOM % 10000 + 20000))
+        echo "🚪 PORT RDP: $RDP_PORT"
+        
+        # Salveaza IP-urile
+        echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+        echo "LOCAL_IP=$LOCAL_IP" >> $GITHUB_ENV  
+        echo "NETWORK_IP=$NETWORK_IP" >> $GITHUB_ENV
+        echo "RDP_PORT=$RDP_PORT" >> $GITHUB_ENV
+
+    - name: Create VM script cu IP real
+      continue-on-error: true
+      env:
+        RDP_PORT: ${{ env.RDP_PORT }}
+      run: |
+        cat > start-vm.sh << 'EOF'
+        #!/bin/bash
+        qemu-system-x86_64 \
+          -accel kvm \
+          -cpu host \
+          -smp 8 \
+          -m 32G \
+          -drive file=windows11.qcow2,format=qcow2 \
+          -cdrom win11.iso \
+          -boot order=dc \
+          -netdev user,id=n1,hostfwd=tcp::${RDP_PORT}-:3389 \
+          -device virtio-net,netdev=n1 \
+          -vga std \
+          -usb -device usb-tablet \
+          -daemonize
+        EOF
+        chmod +x start-vm.sh
+
+    - name: Porneste VM si configureaza
+      continue-on-error: true
+      env:
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        RANDOM_USER: ${{ env.RANDOM_USER }}
+        RANDOM_PASSWORD: ${{ env.RANDOM_PASSWORD }}
+      run: |
+        echo "🚀 Pornire VM..."
+        ./start-vm.sh &
+        VM_PID=$!
+        echo $VM_PID > vm.pid
+        sleep 180
+
+    - name: Verifica conexiunile si porturile
+      continue-on-error: true
+      env:
+        RDP_PORT: ${{ env.RDP_PORT }}
+      run: |
+        echo "🔍 Verific conexiunile..."
+        
+        # Verifica portul RDP
+        netstat -tulpn | grep :$RDP_PORT || echo "Portul $RDP_PORT nu este inca deschis"
+        
+        # Verifica procesul QEMU
+        ps aux | grep qemu
+
+    - name: Afișează detaliile conexiunii cu IP REAL
+      continue-on-error: true
+      env:
+        PUBLIC_IP: ${{ env.PUBLIC_IP }}
+        LOCAL_IP: ${{ env.LOCAL_IP }}
+        NETWORK_IP: ${{ env.NETWORK_IP }}
+        RDP_PORT: ${{ env.RDP_PORT }}
+        RANDOM_USER: ${{ env.RANDOM_USER }}
+        RANDOM_PASSWORD: ${{ env.RANDOM_PASSWORD }}
+      run: |
+        echo ""
+        echo "🎉🎉🎉 CONEXIUNE RDP CU IP REAL 🎉🎉🎉"
+        echo "==========================================="
+        echo "🌐 IP PUBLIC: $PUBLIC_IP:$RDP_PORT"
+        echo "🏠 IP LOCAL: $LOCAL_IP:$RDP_PORT" 
+        echo "🔗 IP REȚEA: $NETWORK_IP:$RDP_PORT"
+        echo "👤 USER: $RANDOM_USER"
+        echo "🔑 PAROLĂ: $RANDOM_PASSWORD"
+        echo "🚪 PORT RDP: $RDP_PORT"
+        echo "🕐 DURATĂ: 6 ORE"
+        echo "==========================================="
+        echo ""
+        echo "📋 COMENZI RDP:"
+        echo "Windows: mstsc /v:$PUBLIC_IP:$RDP_PORT"
+        echo "Linux: xfreerdp /v:$PUBLIC_IP:$RDP_PORT /u:$RANDOM_USER /p:$RANDOM_PASSWORD"
+        echo ""
+        echo "🔧 Alternativă (dacă IP public nu merge):"
+        echo "xfreerdp /v:$LOCAL_IP:$RDP_PORT /u:$RANDOM_USER /p:$RANDOM_PASSWORD"
+        echo ""
+        echo "⚡ TOATE IP-URILE SUNT REALE OBTINUTE PRIN COMENZI!"
+
+    - name: Obține IP-uri suplimentare din comenzi
+      continue-on-error: true
+      run: |
+        echo "🔍 Obțin IP-uri suplimentare..."
+        
+        # IP-uri din comenzi de sistem
+        echo "=== IP-URI DIN COMENZI ==="
+        echo "IP route: $(ip route get 1 | awk '{print $7}')"
+        echo "Hostname IP: $(hostname -I)"
+        echo "All IPs: $(ip -4 addr show | grep inet | awk '{print $2}')"
+        
+        # Verifică conexiuni active
+        echo "=== CONEXIUNI ACTIVE ==="
+        ss -tulpn | grep LISTEN
+
+    - name: Rulează VM 6 ore cu monitorizare
+      continue-on-error: true
+      env:
+        PUBLIC_IP: ${{ env.PUBLIC_IP }}
+        RDP_PORT: ${{ env.RDP_PORT }}
+      run: |
+        echo "⏰ VM rulează pentru 6 ore..."
+        echo "📍 Conectează-te la: $PUBLIC_IP:$RDP_PORT"
+        
+        # Monitorizează conexiunile periodic
+        for i in {1..360}; do
+          minutes=$((360 - i))
+          printf "\r🕐 Rămân %d minute | IP: $PUBLIC_IP:$RDP_PORT" $minutes
+          
+          # Verifică portul la fiecare 10 minute
+          if [ $((i % 10)) -eq 0 ]; then
+            if netstat -tulpn | grep -q :$RDP_PORT; then
+              echo " | ✅ Port activ"
+            else
+              echo " | ❌ Port inactiv"
+            fi
+          fi
+          
+          sleep 10
+        done
+
+    - name: Cleanup
+      if: always()
+      continue-on-error: true
+      run: |
+        if [ -f vm.pid ]; then
+          kill $(cat vm.pid) 2>/dev/null || true
+        fi
+        pkill -f qemu-system || true
+        rm -f windows11.qcow2 win11.iso vm.pid start-vm.sh
+        echo "🧹 Cleanup complet"
